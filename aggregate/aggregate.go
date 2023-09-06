@@ -5,15 +5,15 @@ import (
 	"sync/atomic"
 )
 
-type Callback func(ctx context.Context) error
+type Callback[T any] func(ctx context.Context, args T) error
 
-func CallAfterCount(ctx context.Context, count int64, callbacks ...Callback) Callback {
+func CallAfterCount[T any](ctx context.Context, count int64, callbacks ...Callback[T]) Callback[T] {
 	var internalCount int64
-	return func(ctx context.Context) error {
+	return func(ctx context.Context, args T) error {
 		atomic.AddInt64(&internalCount, 1)
 		if internalCount == count {
 			for _, callback := range callbacks {
-				if err := callback(ctx); err != nil {
+				if err := callback(ctx, args); err != nil {
 					return err
 				}
 			}

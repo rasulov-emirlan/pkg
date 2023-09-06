@@ -8,13 +8,13 @@ import (
 func TestCallAfterCount(t *testing.T) {
 	callCount := 0
 
-	callback := CallAfterCount(context.Background(), 10, func(ctx context.Context) error {
+	callback := CallAfterCount(context.Background(), 10, func(ctx context.Context, _ any) error {
 		callCount++
 		return nil
 	})
 
 	for i := 0; i < 1000; i++ {
-		if err := callback(context.Background()); err != nil {
+		if err := callback(context.Background(), nil); err != nil {
 			t.Fatal(err)
 		}
 	}
