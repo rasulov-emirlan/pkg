@@ -1,12 +1,18 @@
 package main
 
 import (
+	"encoding/json"
 	"log/slog"
 	"os"
 	"os/signal"
 
 	"github.com/rasulov-emirlan/pkg/router"
 )
+
+func init() {
+	l := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{}))
+	slog.SetDefault(l)
+}
 
 func main() {
 	mux := router.NewMultiplexer(":8080")
@@ -21,6 +27,32 @@ func main() {
 		resp.Headers["Content-Type"] = "text/html"
 		resp.Headers["Status"] = "200 OK"
 		resp.Body = []byte("<h1>About</h1>")
+		return nil
+	})
+
+	mux.HandleFunc("/echo", func(req router.Request, resp *router.Response) error {
+		buff := make([]byte, 1024)
+		n, err := req.Body.Read(buff)
+		if err != nil {
+			return err
+		}
+
+		if n < len(buff) {
+			buff = buff[:n]
+		}
+
+		type Echo struct {
+			Message string `json:"message"`
+		}
+		reqBody := Echo{}
+
+		if err := json.Unmarshal(buff, &reqBody); err != nil {
+			return err
+		}
+
+		resp.Headers["Content-Type"] = "text/plain"
+		resp.Headers["Status"] = "200 OK"
+		resp.Body = []byte(reqBody.Message)
 		return nil
 	})
 

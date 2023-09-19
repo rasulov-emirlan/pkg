@@ -1,6 +1,7 @@
 package router
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -8,8 +9,6 @@ import (
 	"log/slog"
 	"net"
 	"net/url"
-	"strconv"
-	"strings"
 )
 
 type Multiplexer struct {
@@ -69,7 +68,7 @@ func (m *Multiplexer) Handle(conn net.Conn) {
 	// read request
 	req, err := parseRequest(conn)
 	if err != nil {
-		slog.Error("parse request error: %v", slog.String("err", err.Error()))
+		slog.Error("parse request error", slog.String("err", err.Error()))
 		return
 	}
 
@@ -80,21 +79,21 @@ func (m *Multiplexer) Handle(conn net.Conn) {
 	resp := Response{
 		Ctx:     req.Ctx,
 		Headers: make(map[string]string),
-		Body:    []byte("Hello World"),
+		Body:    []byte(""),
 	}
 
 	handler, found := m.handlers[req.URL.Path]
 	if !found {
-		slog.Warn("handler not found, will use default", slog.Any("path", req.URL))
+		slog.Warn("handler not found, will use default", slog.Any("path", req.URL.Path))
 		err = defaultHandler(req, &resp)
 		if err != nil {
-			slog.Error("default handler error: %v", slog.String("err", err.Error()))
+			slog.Error("default handler error", slog.String("err", err.Error()))
 			return
 		}
 	} else {
 		err = handler(req, &resp)
 		if err != nil {
-			slog.Error("handler error: %v", slog.String("err", err.Error()))
+			slog.Error("handler error", slog.String("err", err.Error()))
 			return
 		}
 	}
@@ -103,7 +102,19 @@ func (m *Multiplexer) Handle(conn net.Conn) {
 		resp.Headers["Status"] = "200 OK"
 	}
 
-	conn.Write([]byte(fmt.Sprintf(
+	isBodyRead := req.Body.isRead == 1
+	if !isBodyRead {
+		slog.Debug("body is not read, will read it")
+		defer func() {
+			if err := req.Body.Close(); err != nil {
+				slog.Error("close body error", slog.String("err", err.Error()))
+				resp.Headers["Status"] = "500 Internal Server Error"
+			}
+		}()
+	}
+
+	slog.Info("response", slog.String("status", resp.Headers["Status"]), slog.String("body", string(resp.Body)))
+	n, err := conn.Write([]byte(fmt.Sprintf(
 		"HTTP/1.1 %s\r\n"+
 			"Content-Length: %d\r\n"+
 			"Content-Type: %s\r\n"+
@@ -114,126 +125,68 @@ func (m *Multiplexer) Handle(conn net.Conn) {
 		resp.Headers["Content-Type"],
 		resp.Body,
 	)))
+	if err != nil {
+		slog.Error("write response error", slog.String("err", err.Error()))
+		return
+	}
+
+	if n < len(resp.Body) {
+		slog.Error("write response error", slog.String("err", "not all bytes are written"), slog.Group("bytes", slog.Int("n", n), slog.Int("len", len(resp.Body))))
+		return
+	}
 }
 
 func parseRequest(conn net.Conn) (Request, error) {
 	res := Request{Ctx: context.Background()}
 
-	buff := make([]byte, 10000)
-
-	n, err := (conn).Read(buff)
+	reader := bufio.NewReader(conn)
+	buff, err := reader.ReadBytes('\n')
 	if err != nil {
-		return res, err
+		return res, fmt.Errorf("read request line error: %v", err)
 	}
 
-	if n == 0 {
-		return res, errors.New("empty request")
+	// parse request line
+	parts := bytes.SplitN(buff, []byte(" "), 3)
+	if len(parts) != 3 {
+		return res, errors.New("invalid request line")
 	}
 
-	splits := bytes.Split(buff, []byte("\r\n"))
-	if len(splits) < 2 {
-		return res, errors.New("invalid request")
+	res.Method = string(parts[0])
+	res.URL, err = url.Parse(string(parts[1]))
+	if err != nil {
+		return res, fmt.Errorf("parse url error: %v", err)
 	}
+	res.URL.Scheme = "http"
+	res.URL.Host = string(parts[2])
 
-	// Parse Method and Protocol version
-	{
-		sp := bytes.Split(splits[0], []byte(" "))
-		if len(sp) < 3 {
-			return res, errors.New("invalid request: method or protocol version not found")
-		}
-
-		res.Method = string(sp[0])
-		res.Path = string(sp[1])
-		res.Proto = string(sp[2])
-		res.ProtoMajor, res.ProtoMinor = 1, 1 // TODO: change to parsing
-	}
-
-	// Parse URL
-	{
-		sp := bytes.Split(splits[1], []byte(" "))
-		if len(sp) < 2 {
-			return res, errors.New("invalid request: url not found")
-		}
-
-		u, err := url.Parse(string(sp[1]))
+	// parse headers
+	res.Headers = make(map[string]string)
+	for {
+		buff, err := reader.ReadBytes('\n')
 		if err != nil {
-			return res, err
+			return res, fmt.Errorf("read header error: %v", err)
 		}
-
-		u.Path = res.Path
-		res.URL = u
-		res.Host = u.Host
+		if len(buff) <= 2 {
+			break
+		}
+		parts := bytes.SplitN(buff, []byte(":"), 2)
+		if len(parts) != 2 {
+			return res, fmt.Errorf("invalid header: %s", buff)
+		}
+		key := string(bytes.TrimSpace(parts[0]))
+		value := string(bytes.TrimSpace(parts[1]))
+		res.Headers[key] = value
 	}
 
-	// Parse Headers
-	i := 1
-	{
-		res.Headers = make(map[string]string)
-		for ; i < len(splits); i++ {
-			sp := bytes.Split(splits[i], []byte(":"))
-			if len(sp) < 2 {
-				slog.Info("invalid header", "header", sp)
-				continue
-			}
-
-			key := strings.TrimSpace(string(sp[0]))
-			value := strings.TrimSpace(string(sp[1]))
-
-			res.Headers[key] = value
-
-			if key == "Content-Length" {
-				slog.Info("content length", "length", value)
-				break
-			}
-		}
-	}
-
-	// Parse Body
-	{
-		if i < len(splits) {
-			contentLen, ok := res.Headers["Content-Length"]
-			if contentLen == "" || !ok {
-				return res, errors.New("invalid request: content length not found")
-			}
-
-			contentLenInt, err := strconv.Atoi(contentLen)
-			if err != nil {
-				return res, fmt.Errorf("invalid request: content length is not integer: %v", err)
-			}
-
-			if len(splits) < i+2 {
-				return res, errors.New("invalid request: body not found")
-			}
-
-			if len(splits[i+2]) < contentLenInt {
-				return res, errors.New("invalid request: body length is not equal to content length")
-			}
-
-			res.Body = splits[i+2][:contentLenInt]
-		}
-	}
-
+	res.Body = NewBody(reader, conn.Close)
 	return res, nil
 }
 
 func defaultHandler(req Request, resp *Response) error {
-	const msg = `
-		{
-			"method": %q,
-			"url": %q,
-			"headers": %q,
-			"body": %q
-		}
-	`
 	resp.Headers["Content-Length"] = fmt.Sprintf("%d", len(resp.Body))
 	resp.Headers["Content-Type"] = "text/json"
-	resp.Headers["Status"] = "200 OK"
+	resp.Headers["Status"] = "404 Not Found"
 
-	headers := ""
-	for k, v := range req.Headers {
-		headers += fmt.Sprintf("%q=%q,", k, v)
-	}
-
-	resp.Body = []byte(fmt.Sprintf(msg, req.Method, req.URL, headers, req.Body))
+	resp.Body = []byte(`{"error":"not found"}`)
 	return nil
 }
